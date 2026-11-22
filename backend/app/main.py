@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -193,6 +193,40 @@ def chain_snapshot():
     for name, svc in SERVICE_REGISTRY.items():
         results[name] = svc.domain_snapshot()
     return {"modules": results, "total_modules": len(results)}
+
+
+# ---------- 缺采匹配与重放派发（须先于 /api/{module}/{entry_id} 注册） ----------
+
+@app.get("/api/call_log/unrecovered")
+def unrecovered_calls(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=3, ge=1, le=200),
+):
+    """缺采匹配：失败请求编号与后续成功回执对照，按请求编号/失败日期/接口端点检索。
+
+    翻页位置稳定：迟到的 200 回执只更新该笔的恢复状态与响应依据，不移除位置。
+    """
+    from app.services.call_log import CallLogService
+    params = request.query_params
+    return CallLogService().match_unrecovered(
+        request_no=params.get("请求编号", "").strip(),
+        fail_date=params.get("失败日期", "").strip(),
+        endpoint=params.get("接口端点", "").strip(),
+        page=page,
+        size=size,
+    )
+
+
+@app.post("/api/call_log/unrecovered/dispatch")
+def dispatch_unrecovered(payload: dict = Body(default_factory=dict)):
+    """把选中的请求编号派发到重放队列建立待补采项，确认结果回写检索清单。
+
+    领取时凭实际成功回执剔除不再需要执行的请求；重复提交幂等，可安全续做。
+    """
+    from app.services.call_log import CallLogService
+    numbers = payload.get("请求编号列表") or []
+    return CallLogService().dispatch_unrecovered(numbers)
 
 
 # 资源路由含 /api/{module}，必须放在 health / overview 及 chain 接口之后注册，

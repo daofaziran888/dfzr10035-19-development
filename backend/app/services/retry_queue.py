@@ -1,6 +1,8 @@
 """重放队列领域服务：管理失败请求重试，与 request_batch、call_log、api_monitor 联动。"""
 from __future__ import annotations
 
+from datetime import date
+
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -34,9 +36,13 @@ class RetryQueueService(BaseModuleService):
     def _log_retry_start(self, task: dict):
         log_rows = store.rows("call_log")
         tid = str(task["id"]).zfill(4)
+        # 缺采派发时已写入 CALL-RECO 重采日志，加入队列不再重复记录
+        if any(l.get("记录编号") == f"CALL-RECO-{tid}" for l in log_rows):
+            return
         log_rows.append({
             "id": max((int(r.get("id", 0)) for r in log_rows), default=0) + 1,
             "记录编号": f"CALL-RETRY-{tid}",
+            "请求编号": str(task.get("关联请求编号", "")),
             "接口端点": task.get("失败端点", ""),
             "请求参数": f"retry:task={tid}",
             "响应状态": "retrying",
@@ -48,13 +54,19 @@ class RetryQueueService(BaseModuleService):
         })
 
     def _log_retry_success(self, task: dict):
+        """重试成功：把重试/补采日志改写为 200 成功回执，供缺采匹配作为实际响应依据。"""
         tid = str(task["id"]).zfill(4)
         for log in store.rows("call_log"):
-            if log.get("记录编号") == f"CALL-RETRY-{tid}":
+            if log.get("记录编号") in (f"CALL-RETRY-{tid}", f"CALL-RECO-{tid}"):
                 log["status"] = "成功"
+                log["pending"] = False
+                log["abnormal"] = False
                 log["响应状态"] = "200"
+                log["响应耗时"] = "150"
                 log["响应耗时(ms)"] = 150
-                log["返回行数"] = 1
+                log["返回行数"] = "1"
+                log["错误信息"] = ""
+                log["调用时间"] = date.today().isoformat()
                 break
 
     def _update_monitor_health(self, task: dict):
